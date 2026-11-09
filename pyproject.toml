@@ -43,6 +43,9 @@ dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12", "build>=1.2", "prompt-too
 [project.scripts]
 dots-bridge = "dots_bridge.cli:main"
 
+[dependency-groups]
+dev = ["dots-bridge[dev]"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/dots_bridge"]
 
