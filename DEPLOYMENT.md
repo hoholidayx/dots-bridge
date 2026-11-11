@@ -9,6 +9,7 @@
 | ChatGPT 调用 Bridge | 公网 HTTPS → Cloudflare Tunnel → `127.0.0.1:8765` |
 | 应用访问 Bridge HTTP API | SSH 本地端口转发 → `127.0.0.1:8765` |
 | Bridge 验证订阅及投递事件 | Bridge → VPS 上的 Mihomo SOCKS5 `127.0.0.1:17892` → 上游节点 → OpenAI |
+| Bridge 查询 R2 | Bridge → 同一回环端口的 Mihomo HTTP 代理 → R2 HTTPS |
 
 | 路径 | 内容 |
 | --- | --- |
@@ -44,7 +45,7 @@ webhook_proxy_url = "socks5://127.0.0.1:17892"
 
 ### 启用 R2 附件
 
-准备专用私有 R2 桶，为 Bridge 创建权限限制在该桶的对象读写凭据。在私有 `bridge.toml` 末尾配置以下表，并通过运行环境设置 `DOTS_BRIDGE_R2_ACCESS_KEY_ID` 和 `DOTS_BRIDGE_R2_SECRET_ACCESS_KEY`。
+在私有 `bridge.toml` 末尾填写部署选定的 R2 桶。Bridge 将对象写入该桶的 `artifacts/` 前缀。
 
 ```toml
 [r2]
@@ -52,7 +53,9 @@ account_id = "<CLOUDFLARE_ACCOUNT_ID>"
 bucket = "<PRIVATE_R2_BUCKET>"
 ```
 
-Bridge 从 VPS 经 HTTPS 查询 R2，Dot 和应用使用短期 URL 直接上传和下载。应用申请授权的 `/api/artifacts/*` 通过现有 SSH 转发访问。附件由操作者在 R2 手动清理。
+本部署的 `service` 启动器从 `runtime/r2-credentials.json` 读取 `DOTS_BRIDGE_R2_ACCESS_KEY_ID` 和 `DOTS_BRIDGE_R2_SECRET_ACCESS_KEY`，并把 `HTTPS_PROXY` 指向 `http://127.0.0.1:17892`。凭据文件由 root 持有，权限为 `0600`。其他部署可通过进程环境提供这两个变量，并按网络条件配置 HTTPS 代理。
+
+Dot 和应用使用短期 URL 直接上传和下载。应用申请授权的 `/api/artifacts/*` 通过现有 SSH 转发访问。附件由操作者在 R2 手动清理。
 
 升级前暂停 Dot 监听和主动推送任务，等在途请求完成，停止 Bridge 并备份 SQLite 和配置。升级会迁移到 schema 6。重启后刷新 Dot 的工具列表，用新版技能更新任务指令。回复使用 `send_to_app(kind="reply", request_id=...)`，主动推送使用 `kind="push"`。验证纯文本双向收发后再恢复日常任务。需要回退至 schema 5 时，使用升级前备份，并保留升级后的数据库以供恢复期间产生的记录。
 
@@ -88,7 +91,7 @@ ssh -NT -p "$SSH_PORT" \
 
 使用 Mihomo 官方 Linux 发行包并核对 SHA-256。将批准使用的上游节点配置放入 VPS 的 `mihomo/config.yaml`，权限为 `0640`，由管理员写入、Mihomo 服务账户读取。当前管理脚本读取 JSON 格式的 YAML 配置，使用以下监听和路由字段。
 
-- `socks-port` 为 `17892`。
+- `mixed-port` 为 `17892`，供回调使用 SOCKS5，并供 R2 查询使用 HTTP 代理。
 - `allow-lan` 为 `false`，`bind-address` 为 `127.0.0.1`。
 - `mode` 为 `rule`，专用入口的最终 `MATCH` 规则指向已配置的上游节点。
 
