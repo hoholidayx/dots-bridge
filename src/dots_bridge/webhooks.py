@@ -98,12 +98,41 @@ def validate_url(url: str) -> SplitResult:
     return parsed
 
 
-async def post_webhook(url: str, body: bytes, headers: dict[str, str]) -> httpx.Response:
+async def _resolve_over_proxy(hostname: str, proxy_url: str) -> list[str]:
+    """Resolve through HTTPS DNS on the same egress used for webhook delivery."""
+    try:
+        return [str(ipaddress.ip_address(hostname))]
+    except ValueError:
+        pass
+
+    async with httpx.AsyncClient(
+        proxy=proxy_url, timeout=DELIVERY_TIMEOUT, trust_env=False, follow_redirects=False
+    ) as client:
+        responses = await asyncio.gather(
+            *(
+                client.get("https://dns.google/resolve", params={"name": hostname, "type": kind})
+                for kind in ("A", "AAAA")
+            )
+        )
+    addresses = []
+    for response, record_type in zip(responses, (1, 28), strict=True):
+        data = response.raise_for_status().json()
+        if data.get("Status") != 0:
+            raise ValueError("Callback DNS resolution failed")
+        addresses.extend(
+            record["data"] for record in data.get("Answer", []) if record.get("type") == record_type
+        )
+    return addresses
+
+
+async def post_webhook(
+    url: str, body: bytes, headers: dict[str, str], *, proxy_url: str | None = None
+) -> httpx.Response:
     """Resolve once, reject private addresses, and pin TLS to a validated IP.
 
     The original hostname remains in Host and TLS SNI. Each delivery creates a
-    fresh connection, follows no redirects, and ignores environment proxies so
-    DNS validation cannot be bypassed by a reused connection or proxy.
+    fresh connection, follows no redirects, and ignores environment proxies.
+    An explicitly configured SOCKS proxy connects to the same validated IP.
     """
     validate_url(url)
     if len(body) > MAX_BODY_BYTES:
@@ -111,18 +140,22 @@ async def post_webhook(url: str, body: bytes, headers: dict[str, str]) -> httpx.
     original = httpx.URL(url)
     hostname = original.raw_host.decode("ascii")
     async with asyncio.timeout(DELIVERY_TIMEOUT):
-        addresses = await asyncio.get_running_loop().getaddrinfo(
-            hostname, 443, type=socket.SOCK_STREAM
-        )
-        ips = list(dict.fromkeys(address[4][0] for address in addresses))
+        if proxy_url is None:
+            addresses = await asyncio.get_running_loop().getaddrinfo(
+                hostname, 443, type=socket.SOCK_STREAM
+            )
+            ips = [address[4][0] for address in addresses]
+        else:
+            ips = await _resolve_over_proxy(hostname, proxy_url)
         if not ips or any(
             not ipaddress.ip_address(ip).is_global or ipaddress.ip_address(ip).is_multicast
             for ip in ips
         ):
             raise ValueError("Callback must resolve only to public addresses")
         target = original.copy_with(host=ips[0])
+        proxy_options = {"proxy": proxy_url} if proxy_url is not None else {}
         async with httpx.AsyncClient(
-            timeout=DELIVERY_TIMEOUT, follow_redirects=False, trust_env=False
+            timeout=DELIVERY_TIMEOUT, follow_redirects=False, trust_env=False, **proxy_options
         ) as client:
             async with client.stream(
                 "POST",

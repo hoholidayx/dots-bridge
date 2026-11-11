@@ -10,6 +10,7 @@ from contextlib import suppress
 from copy import deepcopy
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from functools import partial
 from uuid import uuid4
 
 import httpx
@@ -39,11 +40,15 @@ logger = logging.getLogger(__name__)
 class DotsBridge:
     """Persistent single-owner bridge. Use create_app() for HTTP and MCP access."""
 
-    def __init__(self, settings: Settings, *, webhook_post=post_webhook):
+    def __init__(self, settings: Settings, *, webhook_post=None):
         self.settings = settings
         self.owner_user_id = settings.owner_user_id
         self.store = Store(settings.db_path, settings.storage_key)
-        self.webhook_post = webhook_post
+        self.webhook_post = (
+            partial(post_webhook, proxy_url=settings.webhook_proxy_url)
+            if webhook_post is None
+            else webhook_post
+        )
         self._worker: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._has_received_handlers = False

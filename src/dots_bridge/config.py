@@ -24,6 +24,7 @@ class Settings(BaseModel):
     db_path: Path = Path("data/bridge.sqlite3")
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535, strict=True)
+    webhook_proxy_url: str | None = None
     subscription_ttl_seconds: int = Field(default=86400, ge=1, le=604800, strict=True)
     reply_timeout_seconds: int = Field(default=3600, ge=1, le=604800, strict=True)
     max_delivery_attempts: int = Field(default=5, ge=1, le=20, strict=True)
@@ -54,6 +55,25 @@ class Settings(BaseModel):
     @classmethod
     def empty_redirect(cls, value):
         return value or None
+
+    @field_validator("webhook_proxy_url")
+    @classmethod
+    def local_webhook_proxy(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "socks5"
+            or parsed.hostname not in {"127.0.0.1", "::1"}
+            or not parsed.port
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("webhook_proxy_url must be a loopback socks5 URL with a port")
+        return value
 
     @field_validator("storage_key")
     @classmethod
@@ -98,6 +118,7 @@ def write_config(path: str | Path, public_base_url: str) -> Path:
         storage_key=Fernet.generate_key().decode(),
     )
     values = settings.model_dump(mode="json")
+    values.pop("webhook_proxy_url")
     values["redirect_uri"] = ""
     content = (
         "# Keep this file private. Restart the server after changing settings.\n"

@@ -180,6 +180,39 @@ async def test_delivery_pins_validated_ip_and_preserves_host_tls_and_body(monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ipv6", ["2606:4700::1111", "::1"])
+async def test_proxy_uses_encrypted_dns_and_rejects_mixed_addresses(monkeypatch, ipv6):
+    requests = []
+    proxy = "socks5://127.0.0.1:1080"
+    constructor = httpx.AsyncClient
+
+    def handle(request):
+        requests.append(request)
+        if request.url.host == "dns.google":
+            assert request.url.params["name"] == "example.com"
+            is_ipv4 = request.url.params["type"] == "A"
+            record = {"type": 1 if is_ipv4 else 28, "data": "93.184.216.34" if is_ipv4 else ipv6}
+            return httpx.Response(200, json={"Status": 0, "Answer": [record]})
+        return httpx.Response(202)
+
+    def client(**kwargs):
+        assert kwargs.pop("proxy") == proxy
+        return constructor(transport=httpx.MockTransport(handle), **kwargs)
+
+    monkeypatch.setattr("dots_bridge.webhooks.httpx.AsyncClient", client)
+    if ipv6 == "::1":
+        with pytest.raises(ValueError, match="public addresses"):
+            await post_webhook("https://example.com/callback", b"{}", {}, proxy_url=proxy)
+        assert len(requests) == 2
+    else:
+        response = await post_webhook("https://example.com/callback", b"{}", {}, proxy_url=proxy)
+        assert response.status_code == 202
+        assert requests[-1].url == "https://93.184.216.34/callback"
+        assert requests[-1].headers["Host"] == "example.com"
+        assert requests[-1].extensions["sni_hostname"] == "example.com"
+
+
+@pytest.mark.asyncio
 async def test_redirect_is_returned_without_following_it(monkeypatch):
     mock_dns(monkeypatch, ["93.184.216.34"])
     requests = []

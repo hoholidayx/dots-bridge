@@ -504,6 +504,7 @@ dots-bridge connector openai --config /path/to/bridge.toml
 | `db_path` | `data/bridge.sqlite3` | SQLite file path, relative to the configuration file |
 | `host` | `127.0.0.1` | Bridge bind address |
 | `port` | `8765` | Bridge bind port |
+| `webhook_proxy_url` | Unset | Loopback SOCKS5 URL for webhook verification and delivery. Callback DNS uses Google Public DNS over HTTPS through the proxy. |
 | `subscription_ttl_seconds` | `86400` | Default and maximum subscription lifetime, in seconds |
 | `reply_timeout_seconds` | `3600` | Time from request creation during which progress and final replies are accepted |
 | `max_delivery_attempts` | `5` | Maximum webhook delivery attempts |
