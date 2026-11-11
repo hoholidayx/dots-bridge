@@ -420,6 +420,7 @@ def test_real_bridge_http_and_sqlite_keep_acknowledgement_across_connector_resta
     async def push(backend):
         return await backend.send_to_app(
             "依頼なしの自発通知 🌏",
+            kind="push",
             channel="work",
             idempotency_key="sqlite-push-1",
             metadata={"source": "real-bridge", "nested": [1, None]},

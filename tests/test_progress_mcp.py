@@ -98,11 +98,11 @@ async def test_progress_tool_metadata_and_instructions_describe_plain_text_and_f
         assert tool["securitySchemes"][0]["scopes"] == ["messages:reply"]
         assert set(tool["inputSchema"]["required"]) == {"request_id", "text", "idempotency_key"}
         assert "does not complete" in tool["description"]
-        assert "reply_to_app" in tool["description"]
+        assert "send_to_app" in tool["description"]
     instructions = create_mcp(backend, None).instructions
     assert "plain text" in instructions
     assert "report_progress" in instructions
-    assert "always use reply_to_app" in instructions
+    assert "Use send_to_app with kind='reply'" in instructions
 
 
 async def test_progress_tool_forwards_plain_text_and_stable_key_without_finalizing():

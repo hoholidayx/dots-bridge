@@ -80,16 +80,16 @@ async def test_progress_preserves_request_context_and_requires_separate_final_re
     second = await bridge.report_progress(
         request_id, "資料が見つかりました。", idempotency_key="step-2"
     )
-    final = await bridge.reply_to_app(request_id, "最終的な調査結果です。")
-    assert final["reply"] == "最終的な調査結果です。"
+    final = await bridge.send_to_app("最終的な調査結果です。", kind="reply", request_id=request_id)
+    assert final["text"] == "最終的な調査結果です。"
     responses = await bridge.list_response_messages(request_id)
     assert responses[:2] == [first, second]
     assert [item["kind"] for item in responses] == ["progress", "progress", "reply"]
-    assert responses[-1]["text"] == final["reply"]
+    assert responses[-1]["text"] == final["text"]
     assert [item["sequence"] for item in responses] == sorted(
         item["sequence"] for item in responses
     )
-    assert (await bridge.get_message(request_id))["reply"] == final["reply"]
+    assert (await bridge.get_message(request_id))["reply"] == final["text"]
     # Retries remain idempotent even after the separate final reply is saved.
     assert (
         await bridge.report_progress(
@@ -148,9 +148,9 @@ async def test_response_query_is_request_scoped_and_paginates_by_global_sequence
     other = await request(bridge, "別の依頼")
     first = await bridge.report_progress(one["request_id"], "開始", idempotency_key="one")
     await bridge.report_progress(other["request_id"], "別依頼の経過", idempotency_key="two")
-    await bridge.send_to_app("独立した通知", channel="chat", idempotency_key="push")
+    await bridge.send_to_app("独立した通知", kind="push", channel="chat", idempotency_key="push")
     second = await bridge.report_progress(one["request_id"], "続き", idempotency_key="three")
-    await bridge.reply_to_app(one["request_id"], "完了")
+    await bridge.send_to_app("完了", kind="reply", request_id=one["request_id"])
     responses = await bridge.list_response_messages(one["request_id"])
     assert [item["text"] for item in responses] == ["開始", "続き", "完了"]
     assert await bridge.list_response_messages(one["request_id"], limit=1) == [first]
@@ -232,7 +232,7 @@ async def test_http_response_messages_require_auth_and_keep_final_status_separat
         assert response.status_code == 200
         assert response.json() == {"messages": [progress]}
         assert (await client.get(f"/api/messages/{request_id}")).json()["reply"] is None
-        await bridge.reply_to_app(request_id, "最終回答")
+        await bridge.send_to_app("最終回答", kind="reply", request_id=request_id)
         assert (await client.get(path, params={"after": progress["sequence"], "limit": 1})).json()[
             "messages"
         ][0]["kind"] == "reply"

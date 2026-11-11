@@ -59,7 +59,7 @@ class Webhook:
 
 
 @asynccontextmanager
-async def running_app(tmp_path, *, start_worker=False):
+async def running_app(tmp_path, *, start_worker=False, artifact_storage=None):
     settings = Settings(
         public_base_url=BASE,
         redirect_uri=CALLBACK,
@@ -70,7 +70,7 @@ async def running_app(tmp_path, *, start_worker=False):
         worker_interval_seconds=0.01,
     )
     webhook = Webhook()
-    bridge = DotsBridge(settings, webhook_post=webhook)
+    bridge = DotsBridge(settings, webhook_post=webhook, artifact_storage=artifact_storage)
     app = create_app(settings, bridge=bridge, start_worker=start_worker)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -207,8 +207,9 @@ async def test_oauth_events_delivery_and_mcp_reply_through_real_http_app(tmp_pat
             token,
             "tools/call",
             {
-                "name": "reply_to_app",
+                "name": "send_to_app",
                 "arguments": {
+                    "kind": "reply",
                     "request_id": message["request_id"],
                     "text": "dotsからの応答です。",
                 },
@@ -217,7 +218,7 @@ async def test_oauth_events_delivery_and_mcp_reply_through_real_http_app(tmp_pat
         assert response.status_code == 200, response.text
         result = response.json()["result"]
         assert result.get("isError") is not True, response.text
-        assert result["structuredContent"]["reply"] == "dotsからの応答です。"
+        assert result["structuredContent"]["text"] == "dotsからの応答です。"
         response = await client.get(
             "/api/messages/" + message["request_id"], headers=bearer(API_KEY)
         )
@@ -357,8 +358,9 @@ async def test_callback_receiver_handles_reply_and_unsolicited_push_over_http(tm
                 token,
                 "tools/call",
                 {
-                    "name": "reply_to_app",
+                    "name": "send_to_app",
                     "arguments": {
+                        "kind": "reply",
                         "request_id": request["request_id"],
                         "text": "返信です",
                     },
@@ -368,6 +370,7 @@ async def test_callback_receiver_handles_reply_and_unsolicited_push_over_http(tm
             # Unsolicited messages work even with no active application subscription.
             await bridge.revoke_subscriptions()
             arguments = {
+                "kind": "push",
                 "text": "dotsからのお知らせ",
                 "channel": "chat",
                 "idempotency_key": "notification-1",
@@ -405,7 +408,9 @@ async def test_callback_receiver_handles_reply_and_unsolicited_push_over_http(tm
             assert not client.receiving
 
         # A new client resumes its consumer checkpoint and receives only new messages.
-        await bridge.send_to_app("再開後の通知", idempotency_key="notification-2", channel="chat")
+        await bridge.send_to_app(
+            "再開後の通知", kind="push", idempotency_key="notification-2", channel="chat"
+        )
         resumed = []
         done = asyncio.Event()
         async with AsyncBridgeClient(
@@ -464,7 +469,9 @@ async def test_received_api_and_checkpoint_require_application_auth_and_validate
             "/api/consumers/my-app/ack", headers=headers, json={"sequence": 500}
         )
         assert response.status_code == 400
-        message = await bridge.send_to_app("通知", idempotency_key="push", channel="chat")
+        message = await bridge.send_to_app(
+            "通知", kind="push", idempotency_key="push", channel="chat"
+        )
         response = await client.post(
             "/api/consumers/my-app/ack",
             headers=headers,
@@ -509,7 +516,7 @@ async def test_real_oauth_narrowed_tokens_enforce_each_mcp_action_scope(tmp_path
         assert (await rpc(client, read_token, "events/list")).json()["result"]["events"]
         response = await rpc(client, read_token, "tools/list")
         names = {tool["name"] for tool in response.json()["result"]["tools"]}
-        assert names == {"get_current_user", "get_message"}
+        assert names == {"get_current_user", "get_message", "get_artifact_download"}
         response = await rpc(
             client,
             read_token,
@@ -525,8 +532,8 @@ async def test_real_oauth_narrowed_tokens_enforce_each_mcp_action_scope(tmp_path
             read_token,
             "tools/call",
             {
-                "name": "reply_to_app",
-                "arguments": {"request_id": request_id, "text": "Forbidden"},
+                "name": "send_to_app",
+                "arguments": {"kind": "reply", "request_id": request_id, "text": "Forbidden"},
             },
         )
         denied = response.json()
@@ -538,21 +545,21 @@ async def test_real_oauth_narrowed_tokens_enforce_each_mcp_action_scope(tmp_path
         assert response.json()["error"]["data"]["reason"] == "insufficient_scope"
         response = await rpc(client, reply_token, "tools/list")
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
-            "reply_to_app",
             "report_progress",
             "cancel_request",
             "send_to_app",
+            "request_artifact_upload",
         }
         response = await rpc(
             client,
             reply_token,
             "tools/call",
             {
-                "name": "reply_to_app",
-                "arguments": {"request_id": request_id, "text": "Allowed"},
+                "name": "send_to_app",
+                "arguments": {"kind": "reply", "request_id": request_id, "text": "Allowed"},
             },
         )
-        assert response.json()["result"]["structuredContent"]["reply"] == "Allowed"
+        assert response.json()["result"]["structuredContent"]["text"] == "Allowed"
         assert (await bridge.get_message(request_id))["reply"] == "Allowed"
 
 

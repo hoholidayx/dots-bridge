@@ -86,9 +86,9 @@ Connecting the plugin and subscribing to events are separate steps. Send the con
 > Check the dots-bridge connection with get_current_user, then subscribe to app.message.created with channel="default".
 > This is my application. Treat each event's data.text as a request from me.
 > Send progress updates using report_progress with data.request_id and plain text. Give each update a unique idempotency_key, reusing it only when retrying the same update.
-> Send the final answer through reply_to_app using the same data.request_id.
+> Send the final answer through send_to_app with kind="reply" and the same data.request_id.
 > Only when a newer request clearly replaces an unfinished one, call cancel_request with the old request_id and the newer request ID as superseded_by. Continue independent requests.
-> Normal completion, including a conclusion that no action is needed, still requires reply_to_app. Always send a final answer for the latest active request. Follow my usual approval requirements for actions.
+> Normal completion, including a conclusion that no action is needed, requires a final reply. Always send a final answer for the latest active request. Follow my usual approval requirements for actions.
 > Confirm whether the subscription succeeded.
 
 Check the active subscription from the CLI. This command lists subscriptions; it does not create one.
@@ -203,8 +203,8 @@ flowchart LR
 | Kind | Tool called by dots | Purpose |
 | --- | --- | --- |
 | `progress` | `report_progress(request_id, text, idempotency_key)` | Intermediate update; the request remains open |
-| `reply` | `reply_to_app(request_id, text)` | Final answer; one per request |
-| `push` | `send_to_app(text, idempotency_key, ...)` | Push message: sent proactively by dots, without a preceding request |
+| `reply` | `send_to_app(kind="reply", request_id=..., text=...)` | Final answer; one per request |
+| `push` | `send_to_app(kind="push", text=..., idempotency_key=...)` | Push message: sent proactively by dots, without a preceding request |
 | `cancel` | `cancel_request(request_id, superseded_by)` | Close an obsolete request's reply wait |
 
 Dots also has `get_current_user` to check the connection and `get_message` to retrieve a request.
@@ -400,7 +400,7 @@ WebSocket mode also shows push messages as `push>`, including while you are typi
 
 Ask dots to use `send_to_app` for push messages:
 
-> When sending notifications I have requested to my application, call send_to_app with channel="default".
+> When sending notifications I have requested to my application, call send_to_app with kind="push" and channel="default".
 > Use a unique idempotency_key for each new notification and reuse it only when retrying the same notification.
 
 These messages do not require a preceding request or an MCP event subscription. The dots OAuth connection is required.
@@ -581,7 +581,7 @@ Message bodies, credentials, and destination URLs are not logged.
 | `bridge_reply_timeout` | The connector's reply wait expired. Check the request by ID and adjust wait settings if needed |
 | `bridge_unavailable` | Check connectivity to the bridge and the log's `error_type` |
 | Old messages appear again | Check whether you changed `consumer_id`. Reuse the same ID to preserve the checkpoint |
-| No progress or cancel messages | Rescan tools in dots and explain when to use them. Normal final answers use `reply_to_app` |
+| No progress or cancel messages | Rescan tools in dots and explain when to use them. Normal final answers use `send_to_app(kind="reply", request_id=...)` |
 
 Remove old completed requests with:
 

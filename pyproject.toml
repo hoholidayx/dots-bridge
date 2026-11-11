@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dots-bridge"
-version = "0.6.0"
+version = "0.7.0"
 description = "Use OpenAI dots from your own apps: a bridge with a Python client and an OpenAI-compatible API."
 readme = "README.md"
 license = "MIT"
@@ -22,6 +22,7 @@ dependencies = [
   "starlette>=1.0.1,<2",
   "uvicorn>=0.35,<1",
   "websockets>=15,<18",
+  "boto3>=1.36,<2",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",

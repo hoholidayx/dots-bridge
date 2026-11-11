@@ -63,15 +63,15 @@ async def test_cancellation_exposes_terminal_receipt_and_wakes_embedded_receiver
     assert status["superseded_by"] == new["request_id"]
     assert status["cancelled_at"] == cancelled["received_at"]
     assert (await bridge.get_message(new["request_id"]))["reply_status"] == "pending"
-    await bridge.reply_to_app(new["request_id"], "new final")
+    await bridge.send_to_app("new final", kind="reply", request_id=new["request_id"])
 
 
 async def test_new_requests_do_not_implicitly_cancel_independent_requests(bridge):
     old = await bridge.send_message("independent first task", channel="chat")
     new = await bridge.send_message("independent second task", channel="chat")
     assert (await bridge.get_message(old["request_id"]))["reply_status"] == "pending"
-    await bridge.reply_to_app(old["request_id"], "first final")
-    await bridge.reply_to_app(new["request_id"], "second final")
+    await bridge.send_to_app("first final", kind="reply", request_id=old["request_id"])
+    await bridge.send_to_app("second final", kind="reply", request_id=new["request_id"])
     assert [message["kind"] for message in await bridge.list_received()] == ["reply", "reply"]
 
 

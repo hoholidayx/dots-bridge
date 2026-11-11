@@ -8,9 +8,11 @@ from typing import Any
 import httpx
 import pytest
 from fastmcp.server.auth import StaticTokenVerifier
+from pydantic import ValidationError
 
 from dots_bridge.errors import BridgeError
 from dots_bridge.mcp import PROTOCOL_VERSION, create_mcp
+from dots_bridge.models import SendInput
 
 
 class Backend:
@@ -36,13 +38,27 @@ class Backend:
     async def get_message(self, request_id):
         return {"request_id": request_id, "text": "Hello", "metadata": {"source": "test"}}
 
-    async def reply_to_app(self, request_id, text):
-        self.calls.append(("reply", request_id, text))
-        if request_id == "missing":
-            raise BridgeError("message_not_found", "Unknown request.", 404)
-        return {"request_id": request_id, "text": text}
-
-    async def send_to_app(self, text, *, channel="default", metadata=None, idempotency_key):
+    async def send_to_app(
+        self, text, *, kind, request_id, channel, metadata, idempotency_key, artifact_ids
+    ):
+        try:
+            SendInput(
+                text=text,
+                kind=kind,
+                request_id=request_id,
+                channel=channel,
+                metadata=metadata,
+                idempotency_key=idempotency_key,
+                artifact_ids=artifact_ids or [],
+            )
+        except ValidationError:
+            raise BridgeError("invalid_send", "Invalid send arguments.") from None
+        if kind == "reply":
+            self.calls.append(("reply", request_id, text))
+            if request_id == "missing":
+                raise BridgeError("message_not_found", "Unknown request.", 404)
+            return {"request_id": request_id, "text": text}
+        channel = channel or "default"
         self.calls.append(("send", text, channel, metadata, idempotency_key))
         payload = {"text": text, "channel": channel, "metadata": metadata or {}}
         if idempotency_key in self.pushes:
@@ -53,6 +69,14 @@ class Backend:
         else:
             self.pushes[idempotency_key] = payload
         return {"id": idempotency_key, **payload}
+
+    async def request_artifact_upload(self, payload):
+        self.calls.append(("upload", payload))
+        return {"artifact_id": "art_" + "a" * 32}
+
+    async def get_artifact_download(self, artifact_id):
+        self.calls.append(("download", artifact_id))
+        return {"artifact_id": artifact_id}
 
 
 @asynccontextmanager
@@ -110,21 +134,18 @@ async def test_modern_discovery_and_tools_survive_sdk_wire_validation():
         assert {tool["name"] for tool in tools} == {
             "get_current_user",
             "get_message",
-            "reply_to_app",
             "report_progress",
             "cancel_request",
             "send_to_app",
+            "request_artifact_upload",
+            "get_artifact_download",
         }
-        reply = next(tool for tool in tools if tool["name"] == "reply_to_app")
-        assert reply["annotations"]["idempotentHint"] is True
-        assert reply["_meta"]["securitySchemes"][0]["scopes"] == ["messages:reply"]
-        assert reply["securitySchemes"] == reply["_meta"]["securitySchemes"]
         push = next(tool for tool in tools if tool["name"] == "send_to_app")
         assert push["annotations"]["idempotentHint"] is True
         assert push["annotations"]["readOnlyHint"] is False
         assert push["_meta"]["securitySchemes"][0]["scopes"] == ["messages:reply"]
         assert push["securitySchemes"] == push["_meta"]["securitySchemes"]
-        assert set(push["inputSchema"]["required"]) == {"text", "idempotency_key"}
+        assert set(push["inputSchema"]["required"]) == {"kind"}
         result = (await call("tools/call", {"name": "get_current_user", "arguments": {}})).json()[
             "result"
         ]
@@ -174,7 +195,10 @@ async def test_reply_tools_call_backend_and_return_safe_errors():
         result = (
             await call(
                 "tools/call",
-                {"name": "reply_to_app", "arguments": {"request_id": "req_1", "text": "Done"}},
+                {
+                    "name": "send_to_app",
+                    "arguments": {"kind": "reply", "request_id": "req_1", "text": "Done"},
+                },
             )
         ).json()["result"]
         assert result["structuredContent"]["text"] == "Done"
@@ -182,7 +206,10 @@ async def test_reply_tools_call_backend_and_return_safe_errors():
         result = (
             await call(
                 "tools/call",
-                {"name": "reply_to_app", "arguments": {"request_id": "missing", "text": "Done"}},
+                {
+                    "name": "send_to_app",
+                    "arguments": {"kind": "reply", "request_id": "missing", "text": "Done"},
+                },
             )
         ).json()["result"]
         assert result["isError"] is True
@@ -198,7 +225,11 @@ async def test_push_tool_needs_no_request_or_subscription_and_preserves_metadata
                 "tools/call",
                 {
                     "name": "send_to_app",
-                    "arguments": {"text": "A reminder", "idempotency_key": "reminder_1"},
+                    "arguments": {
+                        "kind": "push",
+                        "text": "A reminder",
+                        "idempotency_key": "reminder_1",
+                    },
                 },
             )
         ).json()["result"]
@@ -206,6 +237,7 @@ async def test_push_tool_needs_no_request_or_subscription_and_preserves_metadata
         assert backend.calls == [("send", "A reminder", "default", None, "reminder_1")]
 
         arguments = {
+            "kind": "push",
             "text": "Job finished",
             "channel": "jobs.1",
             "metadata": {"job_id": 42, "results": ["ok", None]},
@@ -251,12 +283,20 @@ async def test_push_tool_needs_no_request_or_subscription_and_preserves_metadata
         {"text": "Hello", "idempotency_key": "key", "channel": "x" * 129},
         {"text": "Hello", "idempotency_key": "key", "channel": "bad/channel"},
         {"text": "Hello", "idempotency_key": "key", "metadata": ["not an object"]},
+        {"kind": "reply", "text": "Hello"},
+        {"kind": "reply", "text": "Hello", "request_id": "req_1", "channel": "default"},
+        {"kind": "reply", "text": "Hello", "request_id": "req_1", "idempotency_key": "key"},
+        {"kind": "push", "text": "Hello", "request_id": "req_1", "idempotency_key": "key"},
     ],
 )
 async def test_push_tool_validates_arguments_before_backend_calls(arguments):
     backend = Backend()
     async with rpc_client(backend) as call:
-        result = (await call("tools/call", {"name": "send_to_app", "arguments": arguments})).json()
+        result = (
+            await call(
+                "tools/call", {"name": "send_to_app", "arguments": {"kind": "push", **arguments}}
+            )
+        ).json()
         assert "error" in result or result.get("result", {}).get("isError") is True
         assert backend.calls == []
 
@@ -275,28 +315,59 @@ async def test_authenticated_http_enforces_event_and_reply_scopes():
     async with rpc_client(backend, auth=auth, token="read-token") as call:
         assert "events" in (await call("events/list")).json()["result"]
         tools = (await call("tools/list")).json()["result"]["tools"]
-        assert not {"reply_to_app", "send_to_app"} & {tool["name"] for tool in tools}
+        assert {tool["name"] for tool in tools} == {
+            "get_current_user",
+            "get_message",
+            "get_artifact_download",
+        }
+        upload = {
+            "filename": "test",
+            "size_bytes": 0,
+            "content_md5": "1B2M2Y8AsgTpgAmY7PhCfg==",
+            "idempotency_key": "test",
+        }
         for name, arguments in (
-            ("reply_to_app", {"request_id": "req_1", "text": "Done"}),
-            ("send_to_app", {"text": "A reminder", "idempotency_key": "reminder_1"}),
+            ("send_to_app", {"kind": "reply", "request_id": "req_1", "text": "Done"}),
+            (
+                "send_to_app",
+                {"kind": "push", "text": "A reminder", "idempotency_key": "reminder_1"},
+            ),
+            ("request_artifact_upload", upload),
         ):
             result = (await call("tools/call", {"name": name, "arguments": arguments})).json()
             assert "error" in result or result.get("result", {}).get("isError") is True
         assert backend.calls == []
+        artifact_id = "art_" + "a" * 32
+        download = await call(
+            "tools/call",
+            {"name": "get_artifact_download", "arguments": {"artifact_id": artifact_id}},
+        )
+        assert download.json()["result"]["structuredContent"]["artifact_id"] == artifact_id
     backend = Backend()
     async with rpc_client(backend, auth=auth, token="reply-token") as call:
         error = (await call("events/list")).json()["error"]
         assert error["data"]["reason"] == "insufficient_scope"
         tools = (await call("tools/list")).json()["result"]["tools"]
-        assert {"reply_to_app", "send_to_app"} <= {tool["name"] for tool in tools}
+        assert {tool["name"] for tool in tools} == {
+            "send_to_app",
+            "request_artifact_upload",
+            "report_progress",
+            "cancel_request",
+        }
         result = (
             await call(
                 "tools/call",
                 {
                     "name": "send_to_app",
-                    "arguments": {"text": "A reminder", "idempotency_key": "reminder_1"},
+                    "arguments": {
+                        "kind": "push",
+                        "text": "A reminder",
+                        "idempotency_key": "reminder_1",
+                    },
                 },
             )
         ).json()["result"]
         assert result["structuredContent"]["text"] == "A reminder"
         assert backend.calls == [("send", "A reminder", "default", None, "reminder_1")]
+        grant = await call("tools/call", {"name": "request_artifact_upload", "arguments": upload})
+        assert grant.json()["result"]["structuredContent"]["artifact_id"] == artifact_id

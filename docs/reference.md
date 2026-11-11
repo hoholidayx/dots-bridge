@@ -32,7 +32,8 @@ dots supplies the callback URL and Webhook secret to the server when subscribing
 You do not need to register your public ngrok URL manually as an event delivery destination.
 
 The published listing includes the `app.message.created` event and these tools:
-`get_current_user`, `get_message`, `report_progress`, `reply_to_app`, `cancel_request`, and `send_to_app`.
+`get_current_user`, `get_message`, `report_progress`, `cancel_request`, `send_to_app`,
+`request_artifact_upload`, and `get_artifact_download`.
 Rescan the tools in dots after changing tools or events.
 Connecting the plugin and subscribing to events are separate steps.
 
@@ -214,6 +215,8 @@ It does not affect other consumers' processing positions.
 | `POST /api/messages` | Save a request and return 202 |
 | `GET /api/messages/{request_id}` | Get delivery status and the stored final reply |
 | `GET /api/messages/{request_id}/responses?after=0&limit=100` | Get the request's progress, final reply, and cancellation in stored order |
+| `POST /api/artifacts/uploads` | Reserve a file and get a short-lived R2 upload grant |
+| `GET /api/artifacts/{artifact_id}/download` | Get a short-lived R2 download grant and file metadata |
 | `DELETE /api/subscriptions/{subscription_id}` | Unsubscribe and cancel undelivered requests |
 | `GET /api/received?after=0&limit=100&channel=default` | List received progress, final replies, cancellations, and push messages (`channel` is optional) |
 | `GET /api/consumers/{consumer_id}?channel=default` | Get or initialize a consumer's processing position |
@@ -252,8 +255,45 @@ The response includes fields such as `request_id`, `event_id`, `delivery_status`
 | `error` | Error code without sensitive information; `null` on success |
 
 **202 means the request was saved; `accepted` means the dots Webhook accepted the HTTP delivery.**
-A completed answer is indicated by a reply saved through `reply_to_app`, which sets `reply_status` to `replied`.
+A completed answer is indicated by a reply saved through `send_to_app(kind="reply", request_id=...)`, which sets `reply_status` to `replied`.
 Calling `report_progress` leaves `reply_status` as `pending`.
+
+### Attachments and final sends
+
+Use `send_to_app(kind="reply", request_id=...)` to complete an application request.
+The reply inherits the original channel and metadata. Use `kind="push"` and a stable
+`idempotency_key` for an independent message. Push accepts optional `channel` (default
+`default`) and `metadata`. Both forms return the stored receipt, with
+`request_id: null` for push. Include text, ordered `artifact_ids`, or both. A
+file-only receipt has `text: ""`. Retries must keep the same content and attachment order.
+
+1. To upload from the application, call `request_artifact_upload` on either Python
+   client or POST to `/api/artifacts/uploads`. Dot uses the MCP tool of the same name.
+   Pass a basename, `size_bytes`, `content_md5` (Base64 of the 16 raw MD5 digest bytes),
+   `idempotency_key`, and optional `content_type` (defaults to `application/octet-stream`).
+2. For a `pending` grant, PUT the original bytes to `upload_url` with all
+   `required_headers` using a separate HTTP request. Keep the Bridge token on Bridge calls.
+   The grant also contains `artifact_id` and `expires_at`. Retry an expired grant
+   using the original parameters. After a lost upload response, a subsequent PUT
+   can return `412`. Use the existing ID and let Bridge verify the object on send.
+   A `ready` grant contains the ID and status for an already published attachment.
+3. Send the ID in `artifact_ids` using `send_message` (or `POST /api/messages`) from
+   the application, or `send_to_app` from Dot. Application requests with attachments
+   also require a message idempotency key. The event and request status expose
+   `artifact_ids` for the original request. Request status adds `reply_artifact_ids`
+   for the final reply. Receipts expose their own attachment IDs as `artifact_ids`.
+4. Call `get_artifact_download` through a Python client or MCP, or use the application
+   GET route. The grant has `download_url`, `expires_at`, `filename`, `content_type`,
+   and `size_bytes`. Download via R2 and request a new grant when the link expires.
+   A deleted object returns `404` on the next grant request.
+
+The limit is 20 MiB per file and four files per message. Grants last ten minutes.
+Files use a private bucket with download disposition. The filename and declared
+media type are metadata for the caller. Bridge verifies storage and size while
+R2 checks the signed upload digest. Manage retained objects in R2.
+For files associated with a text-only OpenAI-compatible response, use its Bridge
+request ID to fetch the receipts from the native API. `dots.push` includes any
+attachment IDs in its existing receipt object.
 
 ### Response idempotency and cancellation rules
 
@@ -264,7 +304,7 @@ New progress is rejected after a final answer, but retrying an already stored pr
 `cancel_request` must target an older, unfinished request. Its replacement must be a real, newer request on the same channel and subscription.
 Retrying the same pair returns the same notification; changing the replacement is rejected.
 After cancellation, the older request cannot receive new progress or a final answer.
-The MCP instructions and tool descriptions also specify that normal completion or a conclusion that no action is needed must use `reply_to_app`, and independent requests must not be cancelled.
+The MCP instructions and tool descriptions also specify that normal completion or a conclusion that no action is needed must send a final reply with `send_to_app`, and independent requests must not be cancelled.
 
 <a id="asgi-integration"></a>
 
@@ -298,7 +338,7 @@ See [examples/embedded.py](../examples/embedded.py) for an implementation.
 - **Designed for a single owner.** The bridge does not provide multitenancy or identity management for a public service.
 - Configuration uses TOML. SQLite stores subscriptions, requests, delivery status, progress, final replies, push messages, consumer positions, and OAuth state.
   OAuth access tokens last one hour; refresh tokens last 30 days. Connections survive server restarts.
-- Existing dots-bridge schemas 1–4 automatically migrate to schema 5 in a single transaction on the next bridge startup.
+- Existing dots-bridge schemas 1–5 automatically migrate to schema 6 in a single transaction on the next bridge startup.
   Stored received-message IDs, sequences, and consumer positions are preserved. The connector does not access the database directly.
 - Webhook callback URLs and secrets are encrypted with Fernet. The whole database, including message text, replies, and metadata, is not encrypted.
   Store the database, configuration, and backups where only the owner can read them.
@@ -315,7 +355,7 @@ See [examples/embedded.py](../examples/embedded.py) for an implementation.
   Unsubscribing, expiration, or explicit OAuth revocation stops undelivered requests. HTTP requests already in progress cannot be recalled.
 - MCP cursor replay of event history is unsupported; the bridge returns `cursor: null`.
   Internal outbox retries and MCP history replay are separate features. Even `ttlMs: null` produces a finite subscription expiration time.
-- The package stores the text passed to `report_progress`, `reply_to_app`, and `send_to_app`.
+- The package stores the text passed to `report_progress` and `send_to_app`.
   It cannot guarantee that dots calls these tools or processes a request immediately.
   State the expected reply or notification method in your request to dots.
 - `prune` does not delete received messages or consumer positions. Unprocessed progress and final replies remain available from the received-message list even after their requests are deleted.

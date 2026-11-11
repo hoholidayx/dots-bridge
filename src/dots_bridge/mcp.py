@@ -19,7 +19,9 @@ from mcp.shared.exceptions import MCPError
 from mcp_types import INVALID_PARAMS, PaginatedRequestParams, RequestParams
 from pydantic import BaseModel, ConfigDict, Field
 
+from .artifacts import MAX_ARTIFACT_BYTES, OBJECT_CONTENT_TYPE
 from .errors import BridgeError
+from .models import ArtifactId, ArtifactIds, SendKind
 
 PROTOCOL_VERSION = "2026-07-28"
 
@@ -35,8 +37,6 @@ class BridgeBackend(Protocol):
 
     async def unsubscribe(self, params: dict[str, Any], owner: str) -> dict[str, Any]: ...
 
-    async def reply_to_app(self, request_id: str, text: str) -> dict[str, Any]: ...
-
     async def report_progress(
         self, request_id: str, text: str, *, idempotency_key: str
     ) -> dict[str, Any]: ...
@@ -45,12 +45,19 @@ class BridgeBackend(Protocol):
 
     async def send_to_app(
         self,
-        text: str,
+        text: str = "",
         *,
-        channel: str = "default",
+        kind: SendKind,
+        request_id: str | None = None,
+        channel: str | None = None,
         metadata: dict[str, Any] | None = None,
-        idempotency_key: str,
+        idempotency_key: str | None = None,
+        artifact_ids: list[str] | None = None,
     ) -> dict[str, Any]: ...
+
+    async def request_artifact_upload(self, payload: dict) -> dict[str, Any]: ...
+
+    async def get_artifact_download(self, artifact_id: str) -> dict[str, Any]: ...
 
     async def get_message(self, request_id: str) -> dict[str, Any]: ...
 
@@ -181,31 +188,33 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
     """Build the MCP endpoint used by dots, with draft webhook Events support."""
     mcp = FastMCP(
         "dots-bridge",
-        version="0.6.0",
+        version="0.7.0",
         auth=auth,
         instructions=(
             "This bridge connects its owner's application to this dot. Subscribe to "
             "app.message.created only when the owner asks. Each event contains a "
             "request_id and application text. When the owner has requested replies "
-            "through this bridge, call reply_to_app with that request_id and your "
+            "through this bridge, call send_to_app with kind='reply', that request_id and your "
             "final response. get_message retrieves the original request. Only one "
             "final reply is stored per request; retry the same reply if needed. "
             "You may call report_progress with the request_id and plain text to "
             "send intermediate updates. Each new update needs its own unique "
             "idempotency_key; reuse that key only when retrying the same update. "
-            "Progress does not complete the request: always use reply_to_app for "
+            "Progress leaves the request open. Use send_to_app with kind='reply' for "
             "the final response. "
             "Only when a later request clearly replaces an unfinished earlier request, "
             "call cancel_request with the obsolete request_id and the newer request's ID "
             "as superseded_by. Never cancel independent requests. Normal completion, "
-            "including a conclusion that no action is needed, still requires reply_to_app. "
+            "including a conclusion that no action is needed, requires a final reply. "
             "Always send a final reply for the latest active request. Cancellation closes "
             "the bridge request; it does not forcibly interrupt this dot's execution. "
-            "When the owner authorizes proactive messages, call send_to_app to "
+            "When the owner authorizes proactive messages, call send_to_app with kind='push' to "
             "send application messages without a prior request or subscription. "
-            "Use reply_to_app for responses to application requests so they remain "
-            "correlated. Give each new proactive message a unique idempotency_key "
+            "Give each new proactive message a unique idempotency_key "
             "and reuse that key when retrying the same message. "
+            "For attachments, call request_artifact_upload, PUT the original bytes "
+            "using the returned headers, then include artifact_ids in send_to_app. "
+            "Use get_artifact_download for attachment IDs in an incoming request. "
             "Continue to apply the owner's normal approval requirements."
         ),
     )
@@ -245,30 +254,6 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
         auth=reply_auth,
         meta=_security_meta("messages:reply"),
     )
-    async def reply_to_app(
-        request_id: Annotated[str, Field(min_length=1, max_length=200)],
-        text: Annotated[str, Field(min_length=1, max_length=64000)],
-    ) -> dict[str, Any]:
-        """Send one final text reply to the application request identified by request_id.
-
-        Repeating the same request_id and text succeeds without duplicating the
-        reply. A different second final reply for the same request is rejected.
-        """
-        try:
-            return await bridge.reply_to_app(request_id, text)
-        except BridgeError as exc:
-            raise ToolError(f"{exc.code}: {exc.message}") from None
-
-    @mcp.tool(
-        annotations={
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-        },
-        auth=reply_auth,
-        meta=_security_meta("messages:reply"),
-    )
     async def report_progress(
         request_id: Annotated[str, Field(min_length=1, max_length=200)],
         text: Annotated[str, Field(min_length=1, max_length=64000)],
@@ -287,7 +272,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
         """Send a plain-text intermediate update for an application request.
 
         This does not complete the request or replace its final reply. Call
-        reply_to_app with the same request_id when the final response is ready.
+        send_to_app with kind="reply" and the same request_id for the final response.
         Retrying the same request_id, idempotency_key and text does not duplicate
         the update; reusing the key with different text is rejected.
         """
@@ -314,7 +299,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
 
         superseded_by must name a real, newer request for the same channel and
         subscription. Do not cancel independent requests. For normal completion
-        or a conclusion that nothing needs doing, use reply_to_app instead.
+        or a conclusion that nothing needs doing, send a final reply with send_to_app.
         Always provide a final reply for the latest active request. Repeating the
         same request_id and superseded_by is idempotent; another replacement is
         rejected. This marks the bridge request as cancelled and does not forcibly
@@ -336,37 +321,77 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
         meta=_security_meta("messages:reply"),
     )
     async def send_to_app(
-        text: Annotated[str, Field(min_length=1, max_length=64000)],
-        idempotency_key: Annotated[
-            str,
-            Field(
-                min_length=1,
-                max_length=128,
-                description=(
-                    "A stable unique key for this logical message. Reuse it when retrying "
-                    "the same message and choose a different key for every new message."
-                ),
-            ),
-        ],
-        channel: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[\w.-]+$")] = (
-            "default"
-        ),
+        kind: SendKind,
+        text: Annotated[str, Field(max_length=64000)] = "",
+        request_id: Annotated[str, Field(min_length=1, max_length=200)] | None = None,
+        idempotency_key: Annotated[str, Field(min_length=1, max_length=128)] | None = None,
+        channel: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[\w.-]+$")]
+        | None = None,
         metadata: dict[str, Any] | None = None,
+        artifact_ids: ArtifactIds | None = None,
     ) -> dict[str, Any]:
-        """Send an owner-authorized proactive message to the application.
+        """Send a final reply or an owner-authorized proactive message to the application.
 
-        No prior application request or Events subscription is needed. Use
-        reply_to_app instead for a response to an existing request. Retrying
-        the same idempotency_key and message succeeds without duplicating it;
-        reusing the key with different content is rejected.
+        Use kind="reply" and the original request_id for a final response. The
+        reply inherits the request's channel and metadata. Use kind="push" with
+        a stable idempotency_key for an independent message. Push defaults to
+        channel "default" and needs no request or event subscription.
+        Provide text, uploaded artifact_ids, or both. Keep all content and its
+        identifiers the same when retrying a logical send.
         """
         try:
             return await bridge.send_to_app(
                 text,
+                kind=kind,
+                request_id=request_id,
                 channel=channel,
                 metadata=metadata,
                 idempotency_key=idempotency_key,
+                artifact_ids=artifact_ids,
             )
+        except BridgeError as exc:
+            raise ToolError(f"{exc.code}: {exc.message}") from None
+
+    @mcp.tool(
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+        auth=reply_auth,
+        meta=_security_meta("messages:reply"),
+    )
+    async def request_artifact_upload(
+        filename: Annotated[str, Field(min_length=1, max_length=255)],
+        size_bytes: Annotated[int, Field(ge=0, le=MAX_ARTIFACT_BYTES, strict=True)],
+        content_md5: Annotated[str, Field(min_length=24, max_length=24)],
+        idempotency_key: Annotated[str, Field(min_length=1, max_length=128)],
+        content_type: Annotated[str, Field(max_length=255)] = OBJECT_CONTENT_TYPE,
+    ) -> dict[str, Any]:
+        """Get a one-object upload URL for original file bytes and a reusable artifact_id.
+
+        Pass the file's basename, byte length, and Base64-encoded raw MD5 digest.
+        PUT the file to upload_url using required_headers. Reuse the key to
+        request a fresh grant for the same file. A ready artifact needs no upload.
+        """
+        try:
+            return await bridge.request_artifact_upload(
+                {
+                    "filename": filename,
+                    "size_bytes": size_bytes,
+                    "content_md5": content_md5,
+                    "idempotency_key": idempotency_key,
+                    "content_type": content_type,
+                }
+            )
+        except BridgeError as exc:
+            raise ToolError(f"{exc.code}: {exc.message}") from None
+
+    @mcp.tool(
+        annotations={"readOnlyHint": True},
+        auth=read_auth,
+        meta=_security_meta("events:read"),
+    )
+    async def get_artifact_download(artifact_id: ArtifactId) -> dict[str, Any]:
+        """Get a short-lived GET URL and file metadata for a published attachment."""
+        try:
+            return await bridge.get_artifact_download(artifact_id)
         except BridgeError as exc:
             raise ToolError(f"{exc.code}: {exc.message}") from None
 

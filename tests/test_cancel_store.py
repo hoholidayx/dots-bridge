@@ -276,7 +276,7 @@ async def test_schema_four_migration_preserves_receipts_cursors_and_creation_ord
         await store.run(
             lambda db: db.execute("SELECT value FROM bridge_meta WHERE key='schema'").fetchone()[0]
         )
-        == b"5"
+        == b"6"
     )
 
 

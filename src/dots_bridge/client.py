@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 import httpx
 
+from .artifacts import OBJECT_CONTENT_TYPE, ArtifactUploadInput
 from .errors import BridgeError
 from .models import MessageInput, ReceivedMessage
 from .receiver import ReceivedDispatcher, ReceivedHandler, _cursor, _received
@@ -55,6 +56,12 @@ def _consumer_path(consumer_id: str) -> str:
     if not isinstance(consumer_id, str) or not consumer_id or consumer_id in {".", ".."}:
         raise ValueError("consumer_id must be a nonempty consumer ID")
     return "/api/consumers/" + quote(consumer_id, safe="")
+
+
+def _artifact_download_path(artifact_id: str) -> str:
+    if not isinstance(artifact_id, str) or not artifact_id or artifact_id in {".", ".."}:
+        raise ValueError("artifact_id must be a nonempty attachment ID")
+    return "/api/artifacts/" + quote(artifact_id, safe="") + "/download"
 
 
 def _received_params(after: int, limit: int, channel: str | None) -> dict[str, Any]:
@@ -192,6 +199,7 @@ def _payload(
     subscription_id: str | None,
     metadata: dict[str, Any] | None,
     idempotency_key: str | None,
+    artifact_ids: list[str] | None,
 ) -> dict[str, Any]:
     return MessageInput(
         text=text,
@@ -199,6 +207,7 @@ def _payload(
         subscription_id=subscription_id,
         metadata=metadata if metadata is not None else {},
         idempotency_key=idempotency_key,
+        artifact_ids=artifact_ids if artifact_ids is not None else [],
     ).model_dump(mode="json", exclude_none=True)
 
 
@@ -264,24 +273,50 @@ class BridgeClient:
 
     def send_message(
         self,
-        text: str,
+        text: str = "",
         *,
         channel: str = "default",
         subscription_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        artifact_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Queue one message and return its status, including the request_id."""
         return _decode(
             self._client.post(
                 "/api/messages",
-                json=_payload(text, channel, subscription_id, metadata, idempotency_key),
+                json=_payload(
+                    text, channel, subscription_id, metadata, idempotency_key, artifact_ids
+                ),
             )
         )
 
     def get_message(self, request_id: str) -> dict[str, Any]:
         """Fetch delivery and reply status for an existing request."""
         return _decode(self._client.get(_message_path(request_id)))
+
+    def request_artifact_upload(
+        self,
+        *,
+        filename: str,
+        size_bytes: int,
+        content_md5: str,
+        idempotency_key: str,
+        content_type: str = OBJECT_CONTENT_TYPE,
+    ) -> dict[str, Any]:
+        """Reserve an attachment and obtain a grant for a direct R2 PUT."""
+        upload = ArtifactUploadInput(
+            filename=filename,
+            size_bytes=size_bytes,
+            content_md5=content_md5,
+            idempotency_key=idempotency_key,
+            content_type=content_type,
+        )
+        return _decode(self._client.post("/api/artifacts/uploads", json=upload.model_dump()))
+
+    def get_artifact_download(self, artifact_id: str) -> dict[str, Any]:
+        """Get a direct R2 download grant for a published attachment."""
+        return _decode(self._client.get(_artifact_download_path(artifact_id)))
 
     def list_response_messages(
         self, request_id: str, *, after: int = 0, limit: int = 100
@@ -459,24 +494,50 @@ class AsyncBridgeClient:
 
     async def send_message(
         self,
-        text: str,
+        text: str = "",
         *,
         channel: str = "default",
         subscription_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        artifact_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Queue one message and return its status, including the request_id."""
         return _decode(
             await self._client.post(
                 "/api/messages",
-                json=_payload(text, channel, subscription_id, metadata, idempotency_key),
+                json=_payload(
+                    text, channel, subscription_id, metadata, idempotency_key, artifact_ids
+                ),
             )
         )
 
     async def get_message(self, request_id: str) -> dict[str, Any]:
         """Fetch delivery and reply status for an existing request."""
         return _decode(await self._client.get(_message_path(request_id)))
+
+    async def request_artifact_upload(
+        self,
+        *,
+        filename: str,
+        size_bytes: int,
+        content_md5: str,
+        idempotency_key: str,
+        content_type: str = OBJECT_CONTENT_TYPE,
+    ) -> dict[str, Any]:
+        """Reserve an attachment and obtain a grant for a direct R2 PUT."""
+        upload = ArtifactUploadInput(
+            filename=filename,
+            size_bytes=size_bytes,
+            content_md5=content_md5,
+            idempotency_key=idempotency_key,
+            content_type=content_type,
+        )
+        return _decode(await self._client.post("/api/artifacts/uploads", json=upload.model_dump()))
+
+    async def get_artifact_download(self, artifact_id: str) -> dict[str, Any]:
+        """Get a direct R2 download grant for a published attachment."""
+        return _decode(await self._client.get(_artifact_download_path(artifact_id)))
 
     async def list_response_messages(
         self, request_id: str, *, after: int = 0, limit: int = 100

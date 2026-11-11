@@ -106,7 +106,7 @@ async def test_progress_preserves_context_and_leaves_final_reply_pending(store):
     assert (await store.message("req_one"))["reply"] is None
     assert await store.list_response_messages("req_one") == [progress]
     assert await store.list_received() == [progress]
-    assert await schema_version(store) == b"5"
+    assert await schema_version(store) == b"6"
 
 
 async def test_progress_and_final_replay_in_order_with_request_pagination(store):
@@ -250,7 +250,7 @@ async def test_schema_three_migration_preserves_receipts_cursors_and_sequence_hi
     )
     await make_schema_three(store)
     await store.initialize()
-    assert await schema_version(store) == b"5"
+    assert await schema_version(store) == b"6"
     assert await store.list_received() == before
     assert await store.get_consumer_cursor("consumer", channel="chat") == before[-1]["sequence"]
     assert await add_push(store) == pushed
@@ -305,7 +305,7 @@ async def test_pre_stream_migration_backfills_final_replies_into_current_schema(
     await store.run(downgrade)
     store._ready = False
     await store.initialize()
-    assert await schema_version(store) == b"5"
+    assert await schema_version(store) == b"6"
     responses = await store.list_response_messages("req_one")
     assert len(responses) == 1
     assert responses[0]["kind"] == "reply"
@@ -350,7 +350,7 @@ async def test_migration_failure_rolls_back_table_rebuild_and_schema_version(sto
         is None
     )
     await store.initialize()
-    assert await schema_version(store) == b"5"
+    assert await schema_version(store) == b"6"
     assert await store.list_received() == before
 
 

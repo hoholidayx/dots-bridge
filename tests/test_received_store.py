@@ -75,7 +75,7 @@ async def test_reply_is_appended_once_with_original_request_context(store):
         "channel": "chat-1",
         "text": "reply text",
         "metadata": {"avatar": "ミント"},
-        "received_at": iso8601(original["replied_at"]),
+        "received_at": original["received_at"],
     }
     UUID(received[0]["id"])
     with pytest.raises(BridgeError, match="different final reply"):
@@ -213,7 +213,7 @@ async def test_migration_backfills_replies_once_in_deterministic_order(store, sc
         await store.run(
             lambda db: db.execute("SELECT value FROM bridge_meta WHERE key='schema'").fetchone()[0]
         )
-        == b"5"
+        == b"6"
     )
     store._ready = False
     await store.initialize()

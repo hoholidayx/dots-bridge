@@ -42,6 +42,20 @@ webhook_proxy_url = "socks5://127.0.0.1:17892"
 
 首次注册时，先把 `https://<PUBLIC_MCP_HOST>/mcp` 添加为 OAuth 自定义 MCP，使用 `bridge.toml` 配置的客户端 ID。把注册页面复制出的完整回调地址写入 `redirect_uri`，重启 Bridge 后完成授权。默认客户端 ID 为 `dots-bridge`，令牌端点认证方式为 `none`，权限范围为 `events:read messages:reply`。
 
+### 启用 R2 附件
+
+准备专用私有 R2 桶，为 Bridge 创建权限限制在该桶的对象读写凭据。在私有 `bridge.toml` 末尾配置以下表，并通过运行环境设置 `DOTS_BRIDGE_R2_ACCESS_KEY_ID` 和 `DOTS_BRIDGE_R2_SECRET_ACCESS_KEY`。
+
+```toml
+[r2]
+account_id = "<CLOUDFLARE_ACCOUNT_ID>"
+bucket = "<PRIVATE_R2_BUCKET>"
+```
+
+Bridge 从 VPS 经 HTTPS 查询 R2，Dot 和应用使用短期 URL 直接上传和下载。应用申请授权的 `/api/artifacts/*` 通过现有 SSH 转发访问。附件由操作者在 R2 手动清理。
+
+升级前暂停 Dot 监听和主动推送任务，等在途请求完成，停止 Bridge 并备份 SQLite 和配置。升级会迁移到 schema 6。重启后刷新 Dot 的工具列表，用新版技能更新任务指令。回复使用 `send_to_app(kind="reply", request_id=...)`，主动推送使用 `kind="push"`。验证纯文本双向收发后再恢复日常任务。需要回退至 schema 5 时，使用升级前备份，并保留升级后的数据库以供恢复期间产生的记录。
+
 ## Cloudflare 公网入口
 
 1. 创建托管 Tunnel，在 VPS 的 `cloudflared/token` 保存连接凭据。连接器通过文件读取凭据，启动时使用独立解析器及 HTTP/2。

@@ -76,7 +76,9 @@ def _parser() -> argparse.ArgumentParser:
     send.add_argument("--channel", default="default")
     send.add_argument("--subscription-id")
     send.add_argument("--idempotency-key")
-    send.add_argument("--wait", action="store_true", help="Wait for dots to call reply_to_app")
+    send.add_argument(
+        "--wait", action="store_true", help="Wait for dots to call send_to_app with kind=reply"
+    )
     send.add_argument(
         "--timeout", type=_number, default=120.0, help="Reply wait seconds (default: 120)"
     )

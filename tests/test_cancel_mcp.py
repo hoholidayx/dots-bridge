@@ -42,10 +42,10 @@ async def test_cancel_tool_discovery_and_instructions_limit_semantic_replacement
     assert tool["annotations"]["idempotentHint"] is True
     assert tool["annotations"]["readOnlyHint"] is False
     assert "independent requests" in tool["description"]
-    assert "reply_to_app" in tool["description"]
+    assert "send_to_app" in tool["description"]
     assert "does not forcibly" in tool["description"]
     mcp = create_mcp(backend, None)
-    assert mcp.version == "0.6.0"
+    assert mcp.version == "0.7.0"
     assert "Never cancel independent requests" in mcp.instructions
     assert "latest active request" in mcp.instructions
     assert "no action is needed" in mcp.instructions

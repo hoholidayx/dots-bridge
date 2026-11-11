@@ -427,42 +427,45 @@ async def test_reply_is_correlated_persistent_and_idempotent(bridge, clock):
     await subscribe(bridge)
     sent = await bridge.send_message("question")
     assert await bridge.process_next()
-    first = await bridge.reply_to_app(sent["request_id"], "答えです")
+    first = await bridge.send_to_app("答えです", kind="reply", request_id=sent["request_id"])
     clock.advance(2)
-    duplicate = await bridge.reply_to_app(sent["request_id"], "答えです")
+    duplicate = await bridge.send_to_app("答えです", kind="reply", request_id=sent["request_id"])
     assert duplicate == first
     assert first["request_id"] == sent["request_id"]
     with pytest.raises(BridgeError) as caught:
-        await bridge.reply_to_app(sent["request_id"], "different answer")
+        await bridge.send_to_app("different answer", kind="reply", request_id=sent["request_id"])
     assert caught.value.code == "reply_conflict"
     restarted = DotsBridge(bridge.settings)
     result = await restarted.get_message(sent["request_id"])
     assert result["reply"] == "答えです"
     assert result["reply_status"] == "replied"
-    assert result["replied_at"] == first["replied_at"]
+    assert result["replied_at"] == first["received_at"]
 
 
 async def test_concurrent_duplicate_replies_store_one_final_result(bridge):
     await subscribe(bridge)
     sent = await bridge.send_message("question")
     results = await asyncio.gather(
-        *(bridge.reply_to_app(sent["request_id"], "same answer") for _ in range(6))
+        *(
+            bridge.send_to_app("same answer", kind="reply", request_id=sent["request_id"])
+            for _ in range(6)
+        )
     )
     assert all(result == results[0] for result in results)
 
 
 async def test_reply_unknown_expired_and_invalid_text(bridge, clock):
     with pytest.raises(BridgeError) as caught:
-        await bridge.reply_to_app("req_unknown", "answer")
+        await bridge.send_to_app("answer", kind="reply", request_id="req_unknown")
     assert caught.value.code == "message_not_found"
     await subscribe(bridge)
     sent = await bridge.send_message("question")
     with pytest.raises(BridgeError) as caught:
-        await bridge.reply_to_app(sent["request_id"], "   ")
+        await bridge.send_to_app("   ", kind="reply", request_id=sent["request_id"])
     assert caught.value.code == "invalid_reply"
     clock.advance(bridge.settings.reply_timeout_seconds + 1)
     with pytest.raises(BridgeError) as caught:
-        await bridge.reply_to_app(sent["request_id"], "late answer")
+        await bridge.send_to_app("late answer", kind="reply", request_id=sent["request_id"])
     assert caught.value.code == "reply_expired"
     assert caught.value.status_code == 410
     assert (await bridge.get_message(sent["request_id"]))["reply_status"] == "expired"
@@ -481,7 +484,7 @@ async def test_unsubscribe_blocks_replies_and_cancels_pending_delivery(
     result = await bridge.get_message(sent["request_id"])
     assert result["delivery_status"] == ("accepted" if deliver_first else "cancelled")
     with pytest.raises(BridgeError) as caught:
-        await bridge.reply_to_app(sent["request_id"], "answer")
+        await bridge.send_to_app("answer", kind="reply", request_id=sent["request_id"])
     assert caught.value.code == "message_inactive"
     assert not await bridge.process_next()
     assert len(callback.events) == int(deliver_first)
@@ -528,7 +531,7 @@ async def test_authorization_revocation_removes_all_subscriptions_and_blocks_pen
     assert not await bridge.process_next()
     for request in (first, second):
         with pytest.raises(BridgeError) as caught:
-            await bridge.reply_to_app(request["request_id"], "answer")
+            await bridge.send_to_app("answer", kind="reply", request_id=request["request_id"])
         assert caught.value.code == "message_inactive"
 
 
@@ -562,15 +565,15 @@ async def test_resubscription_cannot_reactivate_old_accepted_requests(bridge, ca
         await bridge.revoke_subscriptions()
     assert (await subscribe(bridge))["id"] == first["id"]
     with pytest.raises(BridgeError) as caught:
-        await bridge.reply_to_app(sent["request_id"], "stale answer")
+        await bridge.send_to_app("stale answer", kind="reply", request_id=sent["request_id"])
     assert caught.value.code == "message_inactive"
     old = await bridge.get_message(sent["request_id"])
     assert old["delivery_status"] == "accepted"
     assert old["reply_status"] == "cancelled"
     current = await bridge.send_message("new generation")
-    assert (await bridge.reply_to_app(current["request_id"], "current answer"))[
-        "reply"
-    ] == "current answer"
+    assert (
+        await bridge.send_to_app("current answer", kind="reply", request_id=current["request_id"])
+    )["text"] == "current answer"
 
 
 async def test_resubscription_after_expiry_cannot_revive_old_delivery_or_reply(bridge, clock):
@@ -586,7 +589,7 @@ async def test_resubscription_after_expiry_cannot_revive_old_delivery_or_reply(b
     for sent in (accepted, queued):
         assert (await bridge.get_message(sent["request_id"]))["reply_status"] == "cancelled"
         with pytest.raises(BridgeError) as caught:
-            await bridge.reply_to_app(sent["request_id"], "stale answer")
+            await bridge.send_to_app("stale answer", kind="reply", request_id=sent["request_id"])
         assert caught.value.code == "message_inactive"
 
 
@@ -596,17 +599,19 @@ async def test_normal_subscription_refresh_preserves_pending_requests(bridge, cl
     assert await bridge.process_next()
     clock.advance(301)
     await subscribe(bridge)
-    result = await bridge.reply_to_app(sent["request_id"], "answer after refresh")
-    assert result["reply"] == "answer after refresh"
+    result = await bridge.send_to_app(
+        "answer after refresh", kind="reply", request_id=sent["request_id"]
+    )
+    assert result["text"] == "answer after refresh"
 
 
 async def test_removal_during_submission_cannot_create_orphaned_outbox_entry(bridge, monkeypatch):
     await subscribe(bridge)
     insert = bridge.store.insert_message
 
-    async def remove_before_insert(message):
+    async def remove_before_insert(message, **kwargs):
         await bridge.unsubscribe(subscription_params(), bridge.owner_user_id)
-        return await insert(message)
+        return await insert(message, **kwargs)
 
     monkeypatch.setattr(bridge.store, "insert_message", remove_before_insert)
     with pytest.raises(BridgeError) as caught:
@@ -657,7 +662,7 @@ async def test_python_reply_rejects_invalid_unicode(bridge):
     await subscribe(bridge)
     sent = await bridge.send_message("question")
     with pytest.raises(BridgeError) as caught:
-        await bridge.reply_to_app(sent["request_id"], "\ud800")
+        await bridge.send_to_app("\ud800", kind="reply", request_id=sent["request_id"])
     assert caught.value.code == "invalid_reply"
     assert caught.value.status_code == 422
 

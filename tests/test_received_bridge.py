@@ -33,7 +33,7 @@ async def test_embedded_decorator_starts_with_app_lifespan_and_wakes_on_push(set
         assert bridge.receiving
         # send_to_app returns after persistence; the callback can keep processing independently.
         pushed = await asyncio.wait_for(
-            bridge.send_to_app("通知", idempotency_key="push-1"),
+            bridge.send_to_app("通知", kind="push", idempotency_key="push-1"),
             1,
         )
         await asyncio.wait_for(entered.wait(), 1)
@@ -53,12 +53,16 @@ async def test_embedded_decorator_starts_with_app_lifespan_and_wakes_on_push(set
 
 async def test_unsolicited_push_does_not_require_subscription_and_is_idempotent(settings):
     bridge = DotsBridge(settings)
-    one = await bridge.send_to_app("通知", channel="news", idempotency_key="push-1")
-    assert (await bridge.send_to_app("通知", channel="news", idempotency_key="push-1")) == one
+    one = await bridge.send_to_app("通知", kind="push", channel="news", idempotency_key="push-1")
+    assert (
+        await bridge.send_to_app("通知", kind="push", channel="news", idempotency_key="push-1")
+    ) == one
     assert one["request_id"] is None
     assert len(await bridge.list_received()) == 1
     with pytest.raises(BridgeError) as caught:
-        await bridge.send_to_app("変更した通知", channel="news", idempotency_key="push-1")
+        await bridge.send_to_app(
+            "変更した通知", kind="push", channel="news", idempotency_key="push-1"
+        )
     assert caught.value.code == "idempotency_conflict"
     await bridge.close()
 
@@ -78,7 +82,9 @@ async def test_unsolicited_push_does_not_require_subscription_and_is_idempotent(
 async def test_invalid_push_fails_before_storage(settings, options):
     bridge = DotsBridge(settings)
     with pytest.raises(BridgeError) as caught:
-        await bridge.send_to_app(**{"text": "hello", "idempotency_key": "push-1", **options})
+        await bridge.send_to_app(
+            kind="push", **{"text": "hello", "idempotency_key": "push-1", **options}
+        )
     assert caught.value.code == "invalid_push"
     assert await bridge.list_received() == []
     await bridge.close()
@@ -87,6 +93,8 @@ async def test_invalid_push_fails_before_storage(settings, options):
 async def test_push_rejects_payload_over_256k(settings):
     bridge = DotsBridge(settings)
     with pytest.raises(BridgeError) as caught:
-        await bridge.send_to_app("通知", idempotency_key="large", metadata={"large": "a" * 262144})
+        await bridge.send_to_app(
+            "通知", kind="push", idempotency_key="large", metadata={"large": "a" * 262144}
+        )
     assert caught.value.status_code == 413
     await bridge.close()

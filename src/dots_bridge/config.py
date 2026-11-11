@@ -9,6 +9,13 @@ from cryptography.fernet import Fernet
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+class R2Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    account_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    bucket: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+
+
 class Settings(BaseModel):
     """File-based single-owner configuration; secrets may be overridden by environment."""
 
@@ -25,6 +32,7 @@ class Settings(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535, strict=True)
     webhook_proxy_url: str | None = None
+    r2: R2Settings | None = None
     subscription_ttl_seconds: int = Field(default=86400, ge=1, le=604800, strict=True)
     reply_timeout_seconds: int = Field(default=3600, ge=1, le=604800, strict=True)
     max_delivery_attempts: int = Field(default=5, ge=1, le=20, strict=True)
@@ -119,6 +127,7 @@ def write_config(path: str | Path, public_base_url: str) -> Path:
     )
     values = settings.model_dump(mode="json")
     values.pop("webhook_proxy_url")
+    values.pop("r2")
     values["redirect_uri"] = ""
     content = (
         "# Keep this file private. Restart the server after changing settings.\n"

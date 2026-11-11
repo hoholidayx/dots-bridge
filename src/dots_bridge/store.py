@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from .errors import BridgeError
+from .errors import BridgeError, artifact_changed, artifact_not_found
 from .models import iso8601
 
 T = TypeVar("T")
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS received_messages (
     kind TEXT NOT NULL CHECK(kind IN ('reply', 'progress', 'push', 'cancel')), request_id TEXT,
     channel TEXT NOT NULL, text TEXT NOT NULL, metadata TEXT NOT NULL,
     received_at REAL NOT NULL, idempotency_key TEXT, fingerprint TEXT NOT NULL,
-    superseded_by TEXT
+    superseded_by TEXT, artifact_ids TEXT NOT NULL DEFAULT '[]'
 );
 """
 
@@ -54,9 +54,16 @@ CREATE TABLE IF NOT EXISTS messages (
     next_attempt_at REAL NOT NULL, lease_until REAL, status_code INTEGER, error TEXT,
     reply TEXT, replied_at REAL, reply_cancelled INTEGER NOT NULL DEFAULT 0,
     idempotency_key TEXT UNIQUE, fingerprint TEXT NOT NULL,
-    event TEXT NOT NULL, superseded_by TEXT, cancelled_at REAL
+    event TEXT NOT NULL, superseded_by TEXT, cancelled_at REAL,
+    artifact_ids TEXT NOT NULL DEFAULT '[]', reply_artifact_ids TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(delivery_status, next_attempt_at);
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY, owner TEXT NOT NULL, object_key TEXT NOT NULL UNIQUE,
+    filename TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+    content_md5 TEXT NOT NULL, idempotency_key TEXT NOT NULL, etag TEXT,
+    UNIQUE(owner, idempotency_key)
+);
 CREATE TABLE IF NOT EXISTS received_consumers (
     consumer_id TEXT PRIMARY KEY, channel TEXT, cursor INTEGER NOT NULL DEFAULT 0
 );
@@ -155,7 +162,7 @@ class Store:
                     if statement.strip():
                         db.execute(statement)
                 version = db.execute("SELECT value FROM bridge_meta WHERE key='schema'").fetchone()
-                if version and version[0] not in (b"1", b"2", b"3", b"4", b"5"):
+                if version and version[0] not in (b"1", b"2", b"3", b"4", b"5", b"6"):
                     raise BridgeError(
                         "storage_version", "Unsupported database schema version.", 500
                     )
@@ -167,7 +174,12 @@ class Store:
                             "reply_cancelled INTEGER NOT NULL DEFAULT 0"
                         )
                 columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
-                for name, column_type in (("superseded_by", "TEXT"), ("cancelled_at", "REAL")):
+                for name, column_type in (
+                    ("superseded_by", "TEXT"),
+                    ("cancelled_at", "REAL"),
+                    ("artifact_ids", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("reply_artifact_ids", "TEXT NOT NULL DEFAULT '[]'"),
+                ):
                     if name not in columns:
                         db.execute(f"ALTER TABLE messages ADD COLUMN {name} {column_type}")
                 check = db.execute("SELECT value FROM bridge_meta WHERE key='key_check'").fetchone()
@@ -186,10 +198,18 @@ class Store:
                         "INSERT INTO bridge_meta VALUES ('key_check', ?)",
                         (self.cipher.encrypt(b"dots-bridge"),),
                     )
-                if had_received and (not version or version[0] != b"5"):
+                if had_received and (not version or version[0] not in (b"5", b"6")):
                     self._migrate_received_messages(db)
                 else:
                     db.execute(RECEIVED_TABLE_SCHEMA)
+                    received_columns = {
+                        row[1] for row in db.execute("PRAGMA table_info(received_messages)")
+                    }
+                    if "artifact_ids" not in received_columns:
+                        db.execute(
+                            "ALTER TABLE received_messages "
+                            "ADD COLUMN artifact_ids TEXT NOT NULL DEFAULT '[]'"
+                        )
                 for statement in RECEIVED_INDEX_SCHEMA.split(";"):
                     if statement.strip():
                         db.execute(statement)
@@ -206,7 +226,7 @@ class Store:
                 db.execute(
                     "INSERT INTO bridge_meta VALUES ('schema', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (b"5",),
+                    (b"6",),
                 )
 
             await self.run(setup)
@@ -310,7 +330,74 @@ class Store:
 
         return await self.run(query)
 
-    async def insert_message(self, message: dict) -> dict:
+    async def reserve_artifact(
+        self, owner: str, artifact_id: str, object_key: str, upload: dict
+    ) -> dict:
+        def reserve(db):
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT INTO artifacts "
+                "(id, owner, object_key, filename, content_type, size_bytes, "
+                "content_md5, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(owner, idempotency_key) DO NOTHING",
+                (
+                    artifact_id,
+                    owner,
+                    object_key,
+                    upload["filename"],
+                    upload["content_type"],
+                    upload["size_bytes"],
+                    upload["content_md5"],
+                    upload["idempotency_key"],
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM artifacts WHERE owner=? AND idempotency_key=?",
+                (owner, upload["idempotency_key"]),
+            ).fetchone()
+            if any(row[field] != value for field, value in upload.items()):
+                raise BridgeError(
+                    "idempotency_conflict", "This upload key was used with different input.", 409
+                )
+            return dict(row)
+
+        return await self.run(reserve)
+
+    @staticmethod
+    def _artifact_rows(db, owner: str, ids: list[str]) -> list[dict]:
+        placeholders = ",".join("?" for _ in ids)
+        rows = {
+            row["id"]: dict(row)
+            for row in db.execute(
+                f"SELECT * FROM artifacts WHERE owner=? AND id IN ({placeholders})", (owner, *ids)
+            )
+        }
+        if len(rows) != len(ids):
+            raise artifact_not_found()
+        return [rows[artifact_id] for artifact_id in ids]
+
+    async def artifacts(self, owner: str, ids: list[str]) -> list[dict]:
+        return await self.run(lambda db: self._artifact_rows(db, owner, ids))
+
+    @classmethod
+    def _confirm_artifacts(cls, db, owner: str, verified: dict[str, str]) -> None:
+        for row in cls._artifact_rows(db, owner, list(verified)):
+            etag = verified[row["id"]]
+            if row["etag"] is None:
+                db.execute("UPDATE artifacts SET etag=? WHERE id=?", (etag, row["id"]))
+            elif row["etag"] != etag:
+                raise artifact_changed()
+
+    async def insert_message(
+        self,
+        message: dict,
+        *,
+        artifact_owner: str = "",
+        verified_artifacts: dict[str, str] | None = None,
+    ) -> dict:
+        if verified_artifacts:
+            message = {**message, "artifact_ids": json.dumps(list(verified_artifacts))}
+
         def insert(db):
             # Serialize idempotency lookup and insert against other submitters.
             db.execute("BEGIN IMMEDIATE")
@@ -328,6 +415,8 @@ class Store:
                 raise BridgeError(
                     "no_subscription", "The selected dots subscription is no longer active.", 409
                 )
+            if verified_artifacts:
+                self._confirm_artifacts(db, artifact_owner, verified_artifacts)
             columns = ",".join(message)
             placeholders = ",".join("?" for _ in message)
             db.execute(
@@ -350,28 +439,58 @@ class Store:
 
         return await self.run(query)
 
-    async def save_reply(self, request_id: str, text: str) -> dict:
+    @classmethod
+    def _existing_reply(cls, db, request_id: str, text: str, ids: list[str]) -> dict | None:
+        row = db.execute("SELECT * FROM messages WHERE request_id=?", (request_id,)).fetchone()
+        if not row:
+            raise BridgeError("message_not_found", "No matching message.", 404)
+        if row["reply"] is None:
+            cls._require_active_request(db, row)
+            return None
+        if row["reply"] != text or json.loads(row["reply_artifact_ids"]) != ids:
+            raise BridgeError("reply_conflict", "A different final reply is already stored.", 409)
+        return public_received(
+            dict(
+                db.execute(
+                    "SELECT * FROM received_messages WHERE request_id=? AND kind='reply'",
+                    (request_id,),
+                ).fetchone()
+            )
+        )
+
+    async def existing_reply(self, request_id: str, text: str, ids: list[str]) -> dict | None:
+        def query(db):
+            db.execute("BEGIN")
+            return self._existing_reply(db, request_id, text, ids)
+
+        return await self.run(query)
+
+    async def save_reply(
+        self,
+        request_id: str,
+        text: str,
+        *,
+        artifact_owner: str = "",
+        verified_artifacts: dict[str, str] | None = None,
+    ) -> dict:
+        ids = list(verified_artifacts or {})
+
         def save(db):
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM messages WHERE request_id=?", (request_id,)).fetchone()
-            if not row:
-                raise BridgeError("message_not_found", "No matching message.", 404)
-            if row["reply"] is not None:
-                if row["reply"] != text:
-                    raise BridgeError(
-                        "reply_conflict", "A different final reply is already stored.", 409
-                    )
-                return dict(row)
-            self._require_active_request(db, row)
+            existing = self._existing_reply(db, request_id, text, ids)
+            if existing is not None:
+                return existing
+            if verified_artifacts:
+                self._confirm_artifacts(db, artifact_owner, verified_artifacts)
             db.execute(
-                "UPDATE messages SET reply=?, replied_at=? WHERE request_id=?",
-                (text, time.time(), request_id),
+                "UPDATE messages SET reply=?, replied_at=?, reply_artifact_ids=? "
+                "WHERE request_id=?",
+                (text, time.time(), json.dumps(ids), request_id),
             )
             saved = db.execute(
                 "SELECT * FROM messages WHERE request_id=?", (request_id,)
             ).fetchone()
-            self._append_reply(db, saved)
-            return dict(saved)
+            return self._append_reply(db, saved)
 
         return await self.run(save)
 
@@ -526,20 +645,44 @@ class Store:
 
     @staticmethod
     def _append_reply(db: sqlite3.Connection, row: sqlite3.Row):
+        receipt_id = str(uuid4())
         db.execute(
             "INSERT INTO received_messages "
-            "(id, kind, request_id, channel, text, metadata, received_at, fingerprint) "
-            "VALUES (?, 'reply', ?, ?, ?, ?, ?, ?)",
+            "(id, kind, request_id, channel, text, metadata, received_at, fingerprint, "
+            "artifact_ids) "
+            "VALUES (?, 'reply', ?, ?, ?, ?, ?, ?, ?)",
             (
-                str(uuid4()),
+                receipt_id,
                 row["request_id"],
                 row["channel"],
                 row["reply"],
                 row["metadata"],
                 row["replied_at"] if row["replied_at"] is not None else row["created_at"],
                 row["fingerprint"],
+                row["reply_artifact_ids"],
             ),
         )
+        return public_received(
+            dict(db.execute("SELECT * FROM received_messages WHERE id=?", (receipt_id,)).fetchone())
+        )
+
+    @staticmethod
+    def _existing_push(db, key: str, fingerprint: str) -> dict | None:
+        row = db.execute(
+            "SELECT * FROM received_messages WHERE kind='push' AND idempotency_key=?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["fingerprint"] != fingerprint:
+            raise BridgeError(
+                "idempotency_conflict",
+                "This idempotency key was already used with different message content.",
+                409,
+            )
+        return public_received(dict(row))
+
+    async def existing_push(self, key: str, fingerprint: str) -> dict | None:
+        return await self.run(lambda db: self._existing_push(db, key, fingerprint))
 
     async def save_push(
         self,
@@ -549,26 +692,21 @@ class Store:
         metadata: dict,
         idempotency_key: str,
         fingerprint: str,
+        artifact_owner: str = "",
+        verified_artifacts: dict[str, str] | None = None,
     ) -> dict:
         def save(db):
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM received_messages WHERE kind='push' AND idempotency_key=?",
-                (idempotency_key,),
-            ).fetchone()
-            if row:
-                if row["fingerprint"] != fingerprint:
-                    raise BridgeError(
-                        "idempotency_conflict",
-                        "This idempotency key was already used with different message content.",
-                        409,
-                    )
-                return public_received(dict(row))
+            existing = self._existing_push(db, idempotency_key, fingerprint)
+            if existing is not None:
+                return existing
+            if verified_artifacts:
+                self._confirm_artifacts(db, artifact_owner, verified_artifacts)
             message_id = str(uuid4())
             db.execute(
                 "INSERT INTO received_messages "
-                "(id, kind, channel, text, metadata, received_at, idempotency_key, fingerprint) "
-                "VALUES (?, 'push', ?, ?, ?, ?, ?, ?)",
+                "(id, kind, channel, text, metadata, received_at, idempotency_key, fingerprint, "
+                "artifact_ids) VALUES (?, 'push', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     message_id,
                     channel,
@@ -577,6 +715,7 @@ class Store:
                     time.time(),
                     idempotency_key,
                     fingerprint,
+                    json.dumps(list(verified_artifacts or {})),
                 ),
             )
             return public_received(
@@ -790,6 +929,10 @@ def public_message(row: dict) -> dict[str, Any]:
         result["cancelled_at"] = (
             iso8601(row["cancelled_at"]) if row["cancelled_at"] is not None else None
         )
+    for field in ("artifact_ids", "reply_artifact_ids"):
+        ids = json.loads(row[field])
+        if ids:
+            result[field] = ids
     return result
 
 
@@ -806,4 +949,7 @@ def public_received(row: dict) -> dict[str, Any]:
     }
     if row["kind"] == "cancel":
         result["superseded_by"] = row["superseded_by"]
+    ids = json.loads(row.get("artifact_ids", "[]"))
+    if ids:
+        result["artifact_ids"] = ids
     return result

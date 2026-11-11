@@ -129,7 +129,10 @@ async def test_mcp_supersession_closes_old_openai_waiter_and_completes_successor
                             )
                             assert not (
                                 await tool(
-                                    "reply_to_app", request_id=new_id, text="新しい要求の最終回答"
+                                    "send_to_app",
+                                    kind="reply",
+                                    request_id=new_id,
+                                    text="新しい要求の最終回答",
                                 )
                             ).get("isError")
                             old, new = await asyncio.gather(*tasks)
@@ -162,7 +165,9 @@ async def test_mcp_supersession_closes_old_openai_waiter_and_completes_successor
                             state = await client.get_message(old_id)
                             assert state["reply_status"] == "cancelled"
                             assert state["superseded_by"] == new_id
-                            late = await tool("reply_to_app", request_id=old_id, text="遅れた回答")
+                            late = await tool(
+                                "send_to_app", kind="reply", request_id=old_id, text="遅れた回答"
+                            )
                             assert late.get("isError") is True
                             assert "message_inactive" in late["content"][0]["text"]
                     finally:

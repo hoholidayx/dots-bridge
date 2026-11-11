@@ -166,7 +166,7 @@ async def test_chat_continues_send_example_checkpoint_without_replaying_processe
         db_path=tmp_path / "bridge.sqlite3",
     )
     bridge = DotsBridge(settings)
-    previous = await bridge.send_to_app("送信テストで処理済み", idempotency_key="old")
+    previous = await bridge.send_to_app("送信テストで処理済み", kind="push", idempotency_key="old")
     # This persisted checkpoint was written by the send_message.py demo.
     await bridge.acknowledge_received("example-app", previous["sequence"], channel="default")
     options = chat.parser().parse_args([])
@@ -175,7 +175,9 @@ async def test_chat_continues_send_example_checkpoint_without_replaying_processe
     class Session:
         async def prompt_async(self, prompt):
             nonlocal new_message
-            new_message = await bridge.send_to_app("チャットで新規受信", idempotency_key="new")
+            new_message = await bridge.send_to_app(
+                "チャットで新規受信", kind="push", idempotency_key="new"
+            )
             async with asyncio.timeout(1):
                 # Observe successful callback acknowledgement in the real SQLite store.
                 while True:  # noqa: ASYNC110 - Wait for the durable receive cursor.

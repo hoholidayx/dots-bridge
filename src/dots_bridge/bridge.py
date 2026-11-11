@@ -16,6 +16,7 @@ from uuid import uuid4
 import httpx
 from pydantic import ValidationError
 
+from .artifacts import ArtifactService, ObjectStorage, R2Storage
 from .config import Settings
 from .errors import BridgeError
 from .models import (
@@ -24,10 +25,11 @@ from .models import (
     CancellationInput,
     MessageInput,
     ProgressInput,
-    PushInput,
     ReceivedAcknowledgement,
     ReceivedConsumer,
     ReceivedQuery,
+    SendInput,
+    SendKind,
     iso8601,
 )
 from .receiver import ReceivedDispatcher
@@ -40,10 +42,23 @@ logger = logging.getLogger(__name__)
 class DotsBridge:
     """Persistent single-owner bridge. Use create_app() for HTTP and MCP access."""
 
-    def __init__(self, settings: Settings, *, webhook_post=None):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        webhook_post=None,
+        artifact_storage: ObjectStorage | None = None,
+    ):
         self.settings = settings
         self.owner_user_id = settings.owner_user_id
         self.store = Store(settings.db_path, settings.storage_key)
+        if artifact_storage is None and settings.r2 is not None:
+            artifact_storage = R2Storage(settings.r2)
+        self._artifacts = (
+            ArtifactService(self.store, self.owner_user_id, artifact_storage)
+            if artifact_storage is not None
+            else None
+        )
         self.webhook_post = (
             partial(post_webhook, proxy_url=settings.webhook_proxy_url)
             if webhook_post is None
@@ -60,6 +75,21 @@ class DotsBridge:
 
     async def initialize(self):
         await self.store.initialize()
+
+    def _artifact_service(self) -> ArtifactService:
+        if self._artifacts is None:
+            raise BridgeError("artifacts_disabled", "Attachment storage is not configured.", 503)
+        return self._artifacts
+
+    async def request_artifact_upload(self, payload: dict) -> dict:
+        service = self._artifact_service()
+        await self.initialize()
+        return await service.request_upload(payload)
+
+    async def get_artifact_download(self, artifact_id: str) -> dict:
+        service = self._artifact_service()
+        await self.initialize()
+        return await service.get_download(artifact_id)
 
     async def start(self):
         await self.initialize()
@@ -303,12 +333,13 @@ class DotsBridge:
 
     async def send_message(
         self,
-        text: str,
+        text: str = "",
         *,
         channel: str = "default",
         subscription_id: str | None = None,
         metadata: dict | None = None,
         idempotency_key: str | None = None,
+        artifact_ids: list[str] | None = None,
     ) -> dict:
         message = MessageInput(
             text=text,
@@ -316,6 +347,7 @@ class DotsBridge:
             subscription_id=subscription_id,
             metadata=metadata if metadata is not None else {},
             idempotency_key=idempotency_key,
+            artifact_ids=artifact_ids if artifact_ids is not None else [],
         )
         return await self.submit(message)
 
@@ -368,9 +400,16 @@ class DotsBridge:
                 "metadata": message.metadata,
             },
         }
+        if message.artifact_ids:
+            event["data"]["artifact_ids"] = message.artifact_ids
         event_json = json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         if len(event_json.encode()) > 262144:
             raise BridgeError("message_too_large", "Serialized event exceeds 256 KiB.", 413)
+        verified = (
+            await self._artifact_service().verify_for_send(message.artifact_ids)
+            if message.artifact_ids
+            else None
+        )
         row = await self.store.insert_message(
             {
                 "request_id": request_id,
@@ -385,7 +424,9 @@ class DotsBridge:
                 "idempotency_key": message.idempotency_key,
                 "fingerprint": fingerprint,
                 "event": event_json,
-            }
+            },
+            artifact_owner=self.owner_user_id,
+            verified_artifacts=verified,
         )
         result = self._check_idempotency(row, fingerprint)
         self._wake.set()
@@ -402,24 +443,6 @@ class DotsBridge:
     async def get_message(self, request_id: str) -> dict:
         await self.initialize()
         return public_message(await self.store.message(request_id))
-
-    async def reply_to_app(self, request_id: str, text: str) -> dict:
-        if not isinstance(text, str) or not text.strip() or len(text) > 64000:
-            raise BridgeError("invalid_reply", "Reply must contain 1–64000 characters.", 422)
-        try:
-            text.encode("utf-8")
-        except UnicodeError:
-            raise BridgeError(
-                "invalid_reply", "Reply must contain valid Unicode text.", 422
-            ) from None
-        await self.initialize()
-        row = await self.store.save_reply(request_id, text)
-        self._receiver.notify()
-        return {
-            "request_id": row["request_id"],
-            "reply": row["reply"],
-            "replied_at": iso8601(row["replied_at"]),
-        }
 
     async def report_progress(self, request_id: str, text: str, *, idempotency_key: str) -> dict:
         """Persist a plain-text update without completing the application request."""
@@ -459,28 +482,72 @@ class DotsBridge:
 
     async def send_to_app(
         self,
-        text: str,
+        text: str = "",
         *,
-        idempotency_key: str,
-        channel: str = "default",
+        kind: SendKind,
+        request_id: str | None = None,
+        idempotency_key: str | None = None,
+        channel: str | None = None,
         metadata: dict | None = None,
+        artifact_ids: list[str] | None = None,
     ) -> dict:
-        """Persist a dots push message independently of request/reply state."""
+        """Persist one final reply or one independent push in the application's inbox."""
         try:
-            message = PushInput(
+            message = SendInput(
+                kind=kind,
                 text=text,
+                request_id=request_id,
                 channel=channel,
-                metadata=metadata if metadata is not None else {},
+                metadata=metadata,
                 idempotency_key=idempotency_key,
+                artifact_ids=artifact_ids if artifact_ids is not None else [],
             )
+        except ValidationError:
+            raise BridgeError(
+                "invalid_reply" if kind == "reply" else "invalid_push",
+                "Invalid message content or fields for the selected kind.",
+                422,
+            ) from None
+        await self.initialize()
+        if message.kind == "reply":
+            result = await self._send_reply(message)
+        else:
+            result = await self._send_push(message)
+        self._receiver.notify()
+        return result
+
+    async def _send_reply(self, message: SendInput) -> dict:
+        request_id = message.request_id
+        assert request_id is not None
+        verified = None
+        if message.artifact_ids:
+            existing = await self.store.existing_reply(
+                request_id, message.text, message.artifact_ids
+            )
+            if existing is not None:
+                return existing
+            verified = await self._artifact_service().verify_for_send(message.artifact_ids)
+        return await self.store.save_reply(
+            request_id, message.text, artifact_owner=self.owner_user_id, verified_artifacts=verified
+        )
+
+    async def _send_push(self, message: SendInput) -> dict:
+        channel = message.channel if message.channel is not None else "default"
+        metadata = message.metadata if message.metadata is not None else {}
+        key = message.idempotency_key
+        assert key is not None
+        body = {"text": message.text, "channel": channel, "metadata": metadata}
+        if message.artifact_ids:
+            body["artifact_ids"] = message.artifact_ids
+        try:
             canonical = json.dumps(
-                {"text": message.text, "channel": message.channel, "metadata": message.metadata},
+                body,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
                 allow_nan=False,
             ).encode("utf-8")
-        except (ValidationError, TypeError, ValueError, RecursionError):
+        except (TypeError, ValueError, RecursionError):
             raise BridgeError(
                 "invalid_push",
                 "Expected valid text, channel, JSON metadata and idempotency_key.",
@@ -488,16 +555,22 @@ class DotsBridge:
             ) from None
         if len(canonical) > 262144:
             raise BridgeError("message_too_large", "Serialized message exceeds 256 KiB.", 413)
-        await self.initialize()
-        result = await self.store.save_push(
+        fingerprint = hashlib.sha256(canonical).hexdigest()
+        verified = None
+        if message.artifact_ids:
+            existing = await self.store.existing_push(key, fingerprint)
+            if existing is not None:
+                return existing
+            verified = await self._artifact_service().verify_for_send(message.artifact_ids)
+        return await self.store.save_push(
             text=message.text,
-            channel=message.channel,
-            metadata=message.metadata,
-            idempotency_key=message.idempotency_key,
-            fingerprint=hashlib.sha256(canonical).hexdigest(),
+            channel=channel,
+            metadata=metadata,
+            idempotency_key=key,
+            fingerprint=fingerprint,
+            artifact_owner=self.owner_user_id,
+            verified_artifacts=verified,
         )
-        self._receiver.notify()
-        return result
 
     async def process_next(self) -> bool:
         """Deliver one due outbox entry. Also useful for deterministic worker tests."""

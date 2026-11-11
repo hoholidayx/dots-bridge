@@ -143,7 +143,7 @@ def create_app(
             message = MessageInput.model_validate(payload)
         except ValidationError:
             raise BridgeError(
-                "invalid_message", "Invalid message fields; check text, channel and metadata.", 422
+                "invalid_message", "Invalid message fields or attachment references.", 422
             ) from None
         return JSONResponse(await bridge.submit(message), status_code=202)
 
@@ -158,6 +158,14 @@ def create_app(
     async def get_message(request: Request):
         authorize(request)
         return JSONResponse(await bridge.get_message(request.path_params["request_id"]))
+
+    async def request_artifact_upload(request: Request):
+        authorize(request)
+        return JSONResponse(await bridge.request_artifact_upload(await parse_json(request)))
+
+    async def get_artifact_download(request: Request):
+        authorize(request)
+        return JSONResponse(await bridge.get_artifact_download(request.path_params["artifact_id"]))
 
     def query_parameters(request, allowed):
         query = dict(request.query_params)
@@ -261,6 +269,8 @@ def create_app(
             Route("/api/messages", submit, methods=["POST"]),
             Route("/api/messages/{request_id}", get_message),
             Route("/api/messages/{request_id}/responses", response_messages),
+            Route("/api/artifacts/uploads", request_artifact_upload, methods=["POST"]),
+            Route("/api/artifacts/{artifact_id}/download", get_artifact_download),
             Route("/api/received", received),
             Route("/api/consumers/{consumer_id}", consumer_cursor),
             Route("/api/consumers/{consumer_id}/ack", acknowledge, methods=["POST"]),

@@ -7,7 +7,7 @@ from .config import Settings
 from .errors import BridgeError
 from .models import ReceivedMessage
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 __all__ = [
     "AsyncBridgeClient",
     "BridgeClient",
