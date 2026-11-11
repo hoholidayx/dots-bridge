@@ -46,15 +46,16 @@ webhook_proxy_url = "socks5://127.0.0.1:17892"
 
 1. 创建托管 Tunnel，在 VPS 的 `cloudflared/token` 保存连接凭据。连接器通过文件读取凭据，启动时使用独立解析器及 HTTP/2。
 2. 为 `<PUBLIC_MCP_HOST>` 创建 Published application，服务地址为 `http://127.0.0.1:8765`。VPS 允许连接器出站 TCP `7844`。
-3. 给 Bridge 域名添加 WAF Block 条件。与已有的地区或白名单拦截条件合并时，用 `or` 连接两个完整条件。
+3. 给 Bridge 域名添加 WAF Block 条件，仅开放下列公网路径。与已有的地区或白名单拦截条件合并时，用 `or` 连接两个完整条件。
 
 ```text
 (
   http.host eq "<PUBLIC_MCP_HOST>"
-  and (
-    http.request.uri.path eq "/api"
-    or starts_with(http.request.uri.path, "/api/")
-  )
+  and not (http.request.uri.path in {
+    "/health" "/mcp" "/authorize" "/consent" "/token" "/revoke"
+    "/.well-known/oauth-authorization-server"
+    "/.well-known/oauth-protected-resource/mcp"
+  })
 )
 ```
 
@@ -92,7 +93,7 @@ Bridge 在 webhook 路径上使用显式的 `webhook_proxy_url`，通过同一�
 把命令末尾替换为 `status` 查看 PID、监听地址和日志位置。停止整套服务时按相反顺序执行 `stop`。部署完成后按以下顺序验证链路。
 
 1. 检查 Mihomo 的 SOCKS5 监听和 Cloudflare Tunnel 连接数。通过 SOCKS5 对 OpenAI 回调主机发起 HTTPS 探测，确认证书校验通过。
-2. 公网 OAuth 发现端点应返回 `200`。公网 `/api/subscriptions` 应返回 Cloudflare `403`。通过私有连接并携带应用 API 密钥访问同一 API 应成功。
+2. 公网 OAuth 发现端点应返回 `200`。公网 `/api/subscriptions` 和包含编码斜杠的 `/api%2Fsubscriptions` 都应返回 Cloudflare `403`。通过私有连接并携带应用 API 密钥访问同一 API 应成功。
 3. 在目标 Dot 建立 `app.message.created` 订阅。通过私有 API 提交唯一测试标记，确认 webhook 接收事件，再按 `request_id` 检查收件箱里的最终回复。
 4. 在 Dot 的授权范围内单独测试 `send_to_app`，在收件箱确认 `kind: "push"`。Webhook 接收成功与 Dot 执行结果可分别核对。Dot 的任务记录可查看操作授权和运行状态。
 
